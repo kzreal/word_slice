@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 标书切片工具 - Web 版本
-使用浏览器访问 http://localhost:5000
+使用浏览器访问 http://localhost:8000
 """
 
 from flask import Flask, render_template, render_template_string, request, jsonify, send_from_directory
@@ -38,6 +38,36 @@ app.config['MAX_CONTENT_LENGTH'] = 2048 * 1024 * 1024
 
 # 增加 Flask 配置来处理大文件上传
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 3600  # 1小时
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024  # 2GB
+app.config['UPLOAD_FOLDER'] = str(UPLOAD_FOLDER)
+
+# 增加 Werkzeug 的大文件上传配置
+from werkzeug.serving import WSGIRequestHandler
+# 禁用请求大小限制日志（避免大文件上传时的性能问题）
+import logging
+logging.getLogger('werkzeug').setLevel(logging.ERROR)
+
+# 请求日志中间件 - 记录所有请求的详细信息
+@app.before_request
+def log_request_info():
+    """记录所有请求的详细信息"""
+    import time
+    request.start_time = time.time()
+    print(f"[REQUEST] {request.method} {request.path}")
+    print(f"[REQUEST] Remote: {request.remote_addr}")
+    if request.content_length:
+        print(f"[REQUEST] Content-Length: {request.content_length}")
+    print(f"[REQUEST] Content-Type: {request.content_type}")
+    print(f"[REQUEST] User-Agent: {request.headers.get('User-Agent', 'Unknown')}")
+    print(f"[REQUEST] Origin: {request.headers.get('Origin', 'None')}")
+
+@app.after_request
+def log_response_info(response):
+    """记录所有响应的详细信息"""
+    import time
+    duration = time.time() - request.start_time
+    print(f"[RESPONSE] {request.method} {request.path} - Status: {response.status_code} - Time: {duration:.3f}s")
+    return response
 
 # 处理文件过大错误
 @app.errorhandler(RequestEntityTooLarge)
@@ -514,6 +544,12 @@ def index():
     <div class="container">
         <h1>📄 标书切片工具</h1>
 
+        <div style="background: #fff7e6; border-left: 3px solid #faad14; padding: 12px; border-radius: 4px; margin-bottom: 20px; font-size: 13px; color: #856404; line-height: 1.5;">
+            <strong>💡 提示:</strong> 本工具适合处理中小型文件（<50MB）。<br>
+            大文件（>100MB）可能因网络问题上传失败。如遇问题，请使用桌面版工具：
+            <code style="background: #f0f0f0; padding: 2px 6px; border-radius: 3px;">python tender_slicer_gui.py</code>
+        </div>
+
         <div class="upload-area" id="uploadArea">
             <div class="icon">📁</div>
             <div class="text">点击或拖拽上传投标文件</div>
@@ -571,6 +607,37 @@ def index():
 
         let selectedFile = null;
 
+        // 页面加载时检查服务器连接
+        async function checkServerHealth() {
+            try {
+                console.log('[HEALTH] 检查服务器连接...');
+                const response = await fetch('/health', {
+                    method: 'GET',
+                    cache: 'no-cache'
+                });
+                if (response.ok) {
+                    const data = await response.json();
+                    console.log('[HEALTH] 服务器正常:', data);
+                    return true;
+                } else {
+                    console.warn('[HEALTH] 服务器响应异常:', response.status);
+                    return false;
+                }
+            } catch (error) {
+                console.error('[HEALTH] 无法连接到服务器:', error);
+                return false;
+            }
+        }
+
+        // 页面加载时执行健康检查
+        window.addEventListener('DOMContentLoaded', async () => {
+            const isHealthy = await checkServerHealth();
+            if (!isHealthy) {
+                console.warn('[WARN] 服务器连接检查失败，切片功能可能无法正常使用');
+                showError('警告: 无法连接到服务器，切片功能可能无法正常工作。请检查服务器是否已启动。');
+            }
+        });
+
         // 层级选项和提示
         const levelOptions = document.querySelectorAll('input[name="sliceLevel"]');
         const levelHint = document.getElementById('levelHint');
@@ -620,11 +687,20 @@ def index():
                 return;
             }
             selectedFile = file;
-            fileInfo.innerHTML = `✓ 已选择: <strong>${file.name}</strong><br>大小: ${formatFileSize(file.size)}`;
+            const fileSizeInfo = `✓ 已选择: <strong>${file.name}</strong><br>大小: ${formatFileSize(file.size)}`;
+            fileInfo.innerHTML = fileSizeInfo;
             fileInfo.classList.add('show');
             sliceBtn.disabled = false;
             result.innerHTML = '';
             result.classList.remove('show');
+
+            // 大文件提示
+            if (file.size > 50 * 1024 * 1024) { // 大于50MB
+                const warningDiv = document.createElement('div');
+                warningDiv.style.cssText = 'margin-top: 10px; padding: 10px; background: #fff7e6; border-left: 3px solid #faad14; border-radius: 4px; color: #856404; font-size: 13px; line-height: 1.5;';
+                warningDiv.innerHTML = '<strong>⚠️ 大文件提示:</strong><br>文件较大，处理可能需要较长时间。请耐心等待，不要关闭页面。如果上传失败，建议使用桌面版工具。';
+                fileInfo.innerHTML += warningDiv.outerHTML;
+            }
 
             // 移除旧的固定下载按钮
             const oldBtn = document.querySelector('.download-btn-fixed');
@@ -640,7 +716,18 @@ def index():
         }
 
         function showError(message) {
-            result.innerHTML = `<div class="error">${message}</div>`;
+            // 添加帮助链接和故障排查建议
+            const helpText = `
+                <div style="margin-top: 10px; font-size: 12px; color: #999;">
+                    <strong>故障排查建议:</strong><br>
+                    • 检查浏览器控制台 (F12) 获取详细错误信息<br>
+                    • 确认服务器正在运行 (访问 <a href="/health" target="_blank" style="color: #667eea; text-decoration: underline;">/health</a>)<br>
+                    • 尝试刷新页面重新加载<br>
+                    • 如果问题持续，请使用桌面版工具
+                </div>
+            `;
+
+            result.innerHTML = `<div class="error">${message}${helpText}</div>`;
             result.classList.add('show');
             sliceBtn.disabled = true;
             fileInfo.classList.remove('show');
@@ -665,7 +752,10 @@ def index():
 
             // 创建 AbortController 用于超时控制
             const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 300000); // 5分钟超时
+            // 超时时间根据文件大小动态调整：大文件给予更长时间
+            const timeoutMs = Math.max(300000, selectedFile.size * 0.001); // 至少5分钟，大文件给予更多时间
+            const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+            console.log(`[DEBUG] 设置超时时间: ${Math.round(timeoutMs / 1000)}秒`);
 
             try {
                 const response = await fetch('/slice', {
@@ -752,11 +842,29 @@ def index():
 
             } catch (error) {
                 clearTimeout(timeoutId);
+                console.error('[ERROR] 请求失败:', error);
+                console.error('[ERROR] 错误名称:', error.name);
+                console.error('[ERROR] 错误消息:', error.message);
+                console.error('[ERROR] 错误堆栈:', error.stack);
+                console.error('[DEBUG] 当前页面URL:', window.location.href);
+
                 let errorMsg = error.message;
+                let errorDetails = '';
+
                 if (error.name === 'AbortError') {
                     errorMsg = '请求超时，文件可能太大或处理时间过长，请尝试较小的文件或使用桌面版工具';
+                } else if (error.name === 'TypeError') {
+                    errorMsg = '网络连接失败 - 服务器可能未启动或无法访问';
+                    errorDetails = '请检查: 1) 服务器是否正常运行 2) 浏览器控制台是否有详细错误 3) 防火墙是否阻止了连接';
+                } else if (error.message && (error.message.includes('Failed to fetch') || error.message.includes('Load failed') || error.message.includes('请求正文流已耗尽') || error.message.includes('请求流') || error.message.includes('stream'))) {
+                    errorMsg = '上传中断 - 请求正文流已耗尽';
+                    errorDetails = '大文件上传时可能遇到网络不稳定问题。建议: 1) 检查网络连接稳定性 2) 尝试使用桌面版工具处理大文件 3) 将文件分成较小的部分处理';
+                } else if (error.message && error.message.includes('NetworkError')) {
+                    errorMsg = '网络错误';
+                    errorDetails = '请检查网络连接和服务器状态';
                 }
-                showError(`❌ ${errorMsg}`);
+
+                showError(`❌ ${errorMsg}${errorDetails ? '\n\n详情: ' + errorDetails : ''}`);
             }
 
             sliceBtn.disabled = false;
@@ -772,13 +880,36 @@ def index():
     ''')
 
 
+@app.route('/health')
+def health_check():
+    """健康检查端点"""
+    return jsonify({
+        'status': 'ok',
+        'timestamp': datetime.now().isoformat(),
+        'version': '1.0.0'
+    })
+
+
+@app.route('/info')
+def server_info():
+    """服务器信息端点"""
+    return jsonify({
+        'max_upload_size_mb': app.config['MAX_CONTENT_LENGTH'] // (1024 * 1024),
+        'supported_formats': ['.docx'],
+        'server_time': datetime.now().isoformat()
+    })
+
+
 @app.route('/slice', methods=['POST'])
 def slice_file():
     """切片文件"""
     upload_path = None
     try:
+        print(f"[DEBUG] ===== /slice 请求开始 =====")
         print(f"[DEBUG] 收到请求，内容长度: {request.content_length}")
         print(f"[DEBUG] 最大允许: {app.config['MAX_CONTENT_LENGTH']}")
+        print(f"[DEBUG] 请求方法: {request.method}")
+        print(f"[DEBUG] 请求路径: {request.path}")
 
         print(f"[DEBUG] 收到请求，文件列表: {list(request.files.keys())}")
         if 'file' not in request.files:
@@ -904,10 +1035,32 @@ def slice_file():
 
 
 if __name__ == '__main__':
+    import socket
+
+    # 检查端口是否可用
+    def check_port_available(port):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(('0.0.0.0', port))
+                return True
+            except OSError:
+                return False
+
     print("=" * 50)
     print("标书切片工具 - Web 版本")
     print("=" * 50)
     print("正在启动服务器...")
+
+    # 检查端口 8000 是否被占用
+    SERVER_PORT = 8000
+    if not check_port_available(SERVER_PORT):
+        print("[ERROR] 端口 8000 已被占用！")
+        print("[ERROR] 请先停止占用该端口的进程:")
+        print(f"[ERROR]   lsof -ti:{SERVER_PORT} | xargs kill -9")
+        print("[ERROR] 或者使用以下命令查看占用进程:")
+        print(f"[ERROR]   lsof -i:{SERVER_PORT}")
+        import sys
+        sys.exit(1)
     print("请在浏览器中访问: http://localhost:8000")
     print("按 Ctrl+C 停止服务器")
     print(f"最大上传文件大小: {app.config['MAX_CONTENT_LENGTH'] // (1024 * 1024)} MB (2GB)")
