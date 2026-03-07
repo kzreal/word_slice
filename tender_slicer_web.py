@@ -92,10 +92,45 @@ class TenderSlicer:
 
     def get_heading_level(self, paragraph):
         """获取段落的大纲级别，0=正文, 1=一级标题, 2=二级标题, ..."""
+        # 方法1: 检查样式名称（支持 "Heading 1", "标题 1", "1. 标题" 等格式）
+        if hasattr(paragraph, 'style') and paragraph.style.name:
+            style_name = paragraph.style.name.lower()
+            # 支持中英文标题样式
+            if 'heading 1' in style_name or '标题 1' in style_name or style_name == '1':
+                return 1
+            elif 'heading 2' in style_name or '标题 2' in style_name or style_name == '2':
+                return 2
+            elif 'heading 3' in style_name or '标题 3' in style_name or style_name == '3':
+                return 3
+            elif 'heading 4' in style_name or '标题 4' in style_name:
+                return 4
+            elif 'heading 5' in style_name or '标题 5' in style_name:
+                return 5
+
+        # 方法2: 检查大纲级别
         if hasattr(paragraph, '_element'):
             p = paragraph._element
             if p.pPr is not None and hasattr(p.pPr, 'outlineLvl') and p.pPr.outlineLvl is not None:
                 return int(p.pPr.outlineLvl.val) + 1
+
+        # 方法3: 通过字体大小和粗体判断（作为最后的备用方案）
+        if hasattr(paragraph, 'runs') and paragraph.runs:
+            try:
+                first_run = paragraph.runs[0]
+                if hasattr(first_run, 'bold') and first_run.bold:
+                    if hasattr(first_run, 'font'):
+                        if hasattr(first_run.font, 'size') and first_run.font.size:
+                            size_pt = first_run.font.size.pt
+                            # 根据字体大小推测标题级别
+                            if size_pt >= 16:  # 16pt及以上可能是一级标题
+                                return 1
+                            elif size_pt >= 14:  # 14-16pt可能是二级标题
+                                return 2
+                            elif size_pt >= 12:  # 12-14pt可能是三级标题
+                                return 3
+            except Exception:
+                pass
+
         return 0
 
     def table_to_markdown(self, table, start_no=1):
