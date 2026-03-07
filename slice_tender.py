@@ -6,15 +6,24 @@
 
 import os
 import re
+from datetime import datetime
 from pathlib import Path
+
 from docx import Document
 from docx.oxml.ns import qn
 
 
 class TenderSlicer:
-    """标书切片器"""
+    """标书切片器 - 将 Word 文档按目录大纲结构切片为多个编号的 Markdown 文件"""
 
     def __init__(self, docx_path: str, output_dir: str = "sliced"):
+        """
+        初始化切片器
+
+        Args:
+            docx_path: 输入的 Word 文档路径
+            output_dir: 输出目录，默认为 "sliced"
+        """
         self.docx_path = Path(docx_path)
         self.output_dir = Path(output_dir)
         self.doc = None
@@ -32,7 +41,12 @@ class TenderSlicer:
     def get_heading_level(self, paragraph):
         """
         获取段落的标题级别
-        返回: 0=正文, 1=一级标题, 2=二级标题, ...
+
+        Args:
+            paragraph: 段落对象
+
+        Returns:
+            int: 0=正文, 1=一级标题, 2=二级标题, ...
         """
         style_name = paragraph.style.name
         if 'Heading' in style_name:
@@ -40,6 +54,7 @@ class TenderSlicer:
             match = re.search(r'Heading\s*(\d+)', style_name, re.IGNORECASE)
             if match:
                 return int(match.group(1))
+
         # 检查大纲级别（有些文档使用大纲级别而不是标题样式）
         if hasattr(paragraph, '_element'):
             p = paragraph._element
@@ -49,7 +64,15 @@ class TenderSlicer:
         return 0
 
     def get_paragraph_text(self, paragraph):
-        """获取段落文本（包括表格内容）"""
+        """
+        获取段落文本
+
+        Args:
+            paragraph: 段落对象
+
+        Returns:
+            str or None: 段落文本，如果为空则返回 None
+        """
         text = paragraph.text.strip()
         if text:
             return text
@@ -57,8 +80,7 @@ class TenderSlicer:
 
     def slice_document(self):
         """
-        切片文档
-        按照标题级别进行切片
+        切片文档，按照标题级别进行切片
         """
         if not self.doc:
             self.load_document()
@@ -111,7 +133,15 @@ class TenderSlicer:
             self.sections.append(current_section)
 
     def table_to_markdown(self, table):
-        """将表格转换为 Markdown 格式"""
+        """
+        将表格转换为 Markdown 格式
+
+        Args:
+            table: 表格对象
+
+        Returns:
+            str or None: Markdown 格式的表格，如果表格为空则返回 None
+        """
         if not table.rows:
             return None
 
@@ -128,7 +158,15 @@ class TenderSlicer:
         return '\n'.join(markdown) + '\n\n'
 
     def sanitize_filename(self, filename):
-        """清理文件名，移除非法字符"""
+        """
+        清理文件名，移除非法字符
+
+        Args:
+            filename: 原始文件名
+
+        Returns:
+            str: 清理后的安全文件名
+        """
         # 移除或替换非法字符
         illegal_chars = r'[<>:"/\\|?*]'
         filename = re.sub(illegal_chars, '', filename)
@@ -186,7 +224,6 @@ class TenderSlicer:
     @staticmethod
     def _get_timestamp():
         """获取当前时间戳"""
-        from datetime import datetime
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def process(self):
