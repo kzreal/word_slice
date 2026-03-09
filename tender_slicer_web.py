@@ -164,10 +164,69 @@ class TenderSlicer:
         return filename.strip()
 
     def slice_document(self, max_level=None):
-        """切片文档，每行添加编号，保留所有表格和图片"""
+        """切片文档，每行添加编号，保留所有表格和图片
+
+        max_level: 切片级别
+            0 - 零级模式：不按章节切片，整个文档转换为一个 Markdown 文件
+            1, 2, 3 - 按指定级别标题切片
+            None 或 'all' - 按所有标题层级切片
+        """
         self.load_document()
 
-        if max_level is None or max_level == 0:
+        # 零级模式：不按章节切片，整个文档为一个 Markdown 文件
+        if max_level == 0:
+            sections = []
+            line_no = 1
+
+            full_section = {
+                'level': 0,
+                'title': self.docx_path.stem,
+                'content': [],
+                'index': 0
+            }
+
+            for block in self.iter_block_items(self.doc):
+                if isinstance(block, Paragraph):
+                    level = self.get_heading_level(block)
+                    text = block.text.strip()
+                    images = self.extract_paragraph_images(block)
+
+                    if not text and not images:
+                        continue
+
+                    if any(kw in text for kw in ['目录', '目  录', 'CONTENTS']):
+                        continue
+
+                    # 保留原始标题结构
+                    if level > 0:
+                        full_section['content'].append(f"<!-- {line_no} --> {'#' * level} {text}\n")
+                        line_no += 1
+                    elif text:
+                        full_section['content'].append(f"<!-- {line_no} --> {text}\n")
+                        line_no += 1
+
+                    for img in images:
+                        full_section['content'].append(f"<!-- {line_no} --> {img}")
+                        line_no += 1
+
+                elif isinstance(block, Table):
+                    table_md, line_no = self.table_to_markdown(block, line_no)
+                    if table_md:
+                        full_section['content'].append(table_md)
+
+                    table_images = self.extract_table_images(block)
+                    for img in table_images:
+                        full_section['content'].append(f"<!-- {line_no} --> {img}")
+                        line_no += 1
+
+            if full_section['content']:
+                sections.append(full_section)
+
+            self.sections = sections
+            return sections
+
+        # 原有逻辑：按章节层级切片
+        if max_level is None or max_level == 'all':
             max_level = float('inf')
 
         sections = []
@@ -285,7 +344,7 @@ def slice_file():
         max_level = request.form.get('max_level', '0')
         try:
             if max_level.lower() == 'all':
-                max_level = 0
+                max_level = None  # 全部层级
             else:
                 max_level = int(max_level)
                 if max_level not in [0, 1, 2, 3]:
@@ -297,7 +356,7 @@ def slice_file():
         file.save(str(upload_path))
 
         slicer = TenderSlicer(upload_path)
-        sections = slicer.slice_document(max_level=max_level if max_level > 0 else None)
+        sections = slicer.slice_document(max_level=max_level)
 
         zip_buffer = io.BytesIO()
 
@@ -522,6 +581,10 @@ _INDEX_HTML = '''<!DOCTYPE html>
         <div id="levelSelector">
             <label>切分层级</label>
             <div class="level-options">
+                <label class="level-option">
+                    <input type="radio" name="sliceLevel" value="0">
+                    <span>零级</span>
+                </label>
                 <label class="level-option">
                     <input type="radio" name="sliceLevel" value="1">
                     <span>一级</span>
