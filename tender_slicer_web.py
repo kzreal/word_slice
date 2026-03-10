@@ -128,7 +128,7 @@ class ImageRecognitionService:
                             'content': [
                                 {
                                     'type': 'text',
-                                    'text': '一直句话直接概括图片的内容，不用加"图片展示..."、"这是...图片"等叙述'
+                                    'text': '十字以内直接概括图片的内容，不用加"图片展示..."、"这是...图片"等叙述'
                                 },
                                 {
                                     'type': 'image_url',
@@ -410,8 +410,8 @@ class TenderSlicer:
                     else:
                         descriptions.append("[图片: 未识别图片]")
 
-                # 合并图片作为新的一行
-                lines.append(f"<!-- {no} -->{' '.join(descriptions)}")
+                # 合并图片作为新的一行，使用表格格式
+                lines.append(f"<!-- {no} --> | " + " | ".join(descriptions) + " |")
                 no += 1
 
             # 添加表格行内容
@@ -1143,55 +1143,75 @@ _INDEX_HTML = '''<!DOCTYPE html>
             formData.append('file', selectedFile);
             formData.append('max_level', document.querySelector('input[name="sliceLevel"]:checked').value);
 
-            updateProgress(10, '正在上传...');
+            const startTime = Date.now();
 
-            const controller = new AbortController();
-            // 增加超时时间：最少 1 小时，或根据文件大小计算
-            const timeoutMs = Math.max(3600000, selectedFile.size * 0.005);
-            const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+            // 使用 XMLHttpRequest 实现真实的上传进度
+            return new Promise((resolve, reject) => {
+                const xhr = new XMLHttpRequest();
 
-            try {
-                const response = await fetch('/slice', {
-                    method: 'POST',
-                    body: formData,
-                    signal: controller.signal
+                // 上传进度
+                xhr.upload.addEventListener('progress', (e) => {
+                    if (e.lengthComputable) {
+                        const percent = Math.min(90, Math.round((e.loaded / e.total) * 80));
+                        const uploadedMB = (e.loaded / 1024 / 1024).toFixed(2);
+                        const totalMB = (e.total / 1024 / 1024).toFixed(2);
+                        const elapsed = (Date.now() - startTime) / 1000;
+                        const speedMBps = (e.loaded / 1024 / 1024 / elapsed).toFixed(2);
+                        updateProgress(percent, `上传中... ${uploadedMB}MB / ${totalMB}MB (${speedMBps}MB/s)`);
+                    }
                 });
 
-                clearTimeout(timeoutId);
-                updateProgress(80, '正在切片...');
+                xhr.addEventListener('load', () => {
+                    if (xhr.status === 200) {
+                        updateProgress(90, '正在生成切片...');
+                        const blob = new Blob([xhr.response], { type: 'application/zip' });
+                        const url = URL.createObjectURL(blob);
 
-                if (!response.ok) {
-                    let errorMsg = '处理失败';
-                    try {
-                        const errorData = await response.json();
-                        errorMsg = errorData.error || errorMsg;
-                    } catch {}
-                    throw new Error(errorMsg);
-                }
+                        const sectionCount = xhr.getResponseHeader('X-Section-Count') || '多个';
+                        result.innerHTML = `<div class="success">✅ 切片完成！共 ${sectionCount} 个章节</div>`;
 
-                updateProgress(100, '处理完成！');
+                        const downloadBtn = document.createElement('a');
+                        downloadBtn.href = url;
+                        downloadBtn.download = 'sliced_documents.zip';
+                        downloadBtn.className = 'download-btn';
+                        downloadBtn.textContent = '⬇️ 下载切片结果';
+                        downloadBtn.style.display = 'block';
+                        downloadBtn.style.textAlign = 'center';
+                        result.appendChild(downloadBtn);
+                        result.classList.add('show');
 
-                const blob = await response.blob();
-                const url = URL.createObjectURL(blob);
+                        updateProgress(100, '处理完成！');
+                        sliceBtn.disabled = false;
+                        resolve();
+                    } else {
+                        let errorMsg = '处理失败';
+                        try {
+                            const errorData = JSON.parse(xhr.responseText);
+                            errorMsg = errorData.error || errorMsg;
+                        } catch {}
+                        showError(`❌ ${errorMsg}`);
+                        sliceBtn.disabled = false;
+                        reject(new Error(errorMsg));
+                    }
+                });
 
-                result.innerHTML = `<div class="success">✅ 切片完成！共 ${response.headers.get('X-Section-Count') || '多个'} 个章节</div>`;
+                xhr.addEventListener('error', () => {
+                    showError('❌ 网络错误，请重试');
+                    sliceBtn.disabled = false;
+                    reject(new Error('网络错误'));
+                });
 
-                const downloadBtn = document.createElement('a');
-                downloadBtn.href = url;
-                downloadBtn.download = 'sliced_documents.zip';
-                downloadBtn.className = 'download-btn';
-                downloadBtn.textContent = '⬇️ 下载切片结果';
-                downloadBtn.style.display = 'block';
-                downloadBtn.style.textAlign = 'center';
-                result.appendChild(downloadBtn);
-                result.classList.add('show');
+                xhr.addEventListener('timeout', () => {
+                    showError('❌ 请求超时，请重试');
+                    sliceBtn.disabled = false;
+                    reject(new Error('请求超时'));
+                });
 
-            } catch (error) {
-                clearTimeout(timeoutId);
-                showError(`❌ ${error.message}`);
-            }
-
-            sliceBtn.disabled = false;
+                xhr.responseType = 'blob';
+                xhr.timeout = Math.max(3600000, selectedFile.size * 0.005);
+                xhr.open('POST', '/slice');
+                xhr.send(formData);
+            });
         });
 
         function updateProgress(value, text) {
