@@ -6,25 +6,69 @@
 
 import io
 import logging
+import os
 import zipfile
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
-from docx import Document
-from docx.document import Document as DocxDocument
-from docx.oxml.table import CT_Tbl
-from docx.oxml.text.paragraph import CT_P
-from docx.table import Table
-from docx.text.paragraph import Paragraph
-from flask import Flask, jsonify, render_template_string, request
-from werkzeug.exceptions import ClientDisconnected, RequestEntityTooLarge
+try:
+    import requests
+    import sys
+    from docx import Document
+    from docx.document import Document as DocxDocument
+    from docx.oxml.table import CT_Tbl
+    from docx.oxml.text.paragraph import CT_P
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+    from dotenv import load_dotenv
+    from flask import Flask, jsonify, render_template_string, request
+    from werkzeug.exceptions import ClientDisconnected, RequestEntityTooLarge
+except ImportError as e:
+    print(f"缺少依赖: {e}")
+    print("请运行: pip install -r requirements.txt")
+    sys.exit(1)
+
+# =============================================================================
+# 日志配置
+# =============================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('/tmp/tender_slicer_web.log', encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 
 # =============================================================================
 # Flask 应用配置
 # =============================================================================
 
 app = Flask(__name__)
+
+# Load environment variables
+load_dotenv()
+
+# LLM Configuration
+LLM_API_ENDPOINT = os.getenv('LLM_API_ENDPOINT', '').strip()
+LLM_API_KEY = os.getenv('LLM_API_KEY', '').strip()
+LLM_MODEL = os.getenv('LLM_MODEL', 'vision-model').strip()
+LLM_TIMEOUT = int(os.getenv('LLM_TIMEOUT', '30'))
+LLM_MAX_RETRIES = int(os.getenv('LLM_MAX_RETRIES', '3'))
+
+# Validate configuration
+LLM_AVAILABLE = bool(LLM_API_ENDPOINT and LLM_API_KEY)
+if LLM_AVAILABLE:
+    logging.info("LLM image recognition enabled")
+    logging.info(f"LLM endpoint: {LLM_API_ENDPOINT[:50]}...")
+    logging.info(f"LLM model: {LLM_MODEL}")
+else:
+    logging.warning("LLM image recognition disabled - missing configuration")
+    if not LLM_API_ENDPOINT:
+        logging.warning("LLM_API_ENDPOINT not set")
+    if not LLM_API_KEY:
+        logging.warning("LLM_API_KEY not set")
 
 UPLOAD_FOLDER = Path(__file__).parent / 'download'
 UPLOAD_FOLDER.mkdir(exist_ok=True)
@@ -40,6 +84,104 @@ logging.getLogger('werkzeug').setLevel(logging.ERROR)
 # 标书切片器类
 # =============================================================================
 
+class ImageRecognitionService:
+    """图像识别服务 - 通过 LLM API 识别图像内容"""
+
+    def __init__(self, endpoint, api_key, model, timeout, max_retries):
+        self.endpoint = endpoint
+        self.api_key = api_key
+        self.model = model
+        self.timeout = timeout
+        self.max_retries = max_retries
+
+        # 创建 HTTP session
+        self.session = requests.Session()
+        self.session.headers.update({
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json'
+        })
+
+        # 重试配置
+        self.retry_adapter = requests.adapters.HTTPAdapter(
+            max_retries=max_retries,
+            pool_connections=10,
+            pool_maxsize=100
+        )
+        self.session.mount('http://', self.retry_adapter)
+        self.session.mount('https://', self.retry_adapter)
+
+    def describe_image(self, image_data, image_format):
+        """发送图像到 LLM API 获取描述"""
+        # 重试逻辑
+        for attempt in range(self.max_retries):
+            try:
+                # 编码图像为 base64
+                import base64
+                base64_image = base64.b64encode(image_data).decode('utf-8')
+
+                # 构建请求体
+                request_data = {
+                    'model': self.model,
+                    'messages': [
+                        {
+                            'role': 'user',
+                            'content': [
+                                {
+                                    'type': 'text',
+                                    'text': '一直句话直接概括图片的内容，不用加"图片展示..."、"这是...图片"等叙述'
+                                },
+                                {
+                                    'type': 'image_url',
+                                    'image_url': {
+                                        'url': f'data:image/{image_format};base64,{base64_image}'
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    'max_tokens': 100
+                }
+
+                # 发送请求
+                response = self.session.post(
+                    self.endpoint,
+                    json=request_data,
+                    timeout=self.timeout
+                )
+
+                response.raise_for_status()
+
+                # 解析响应
+                result = response.json()
+                content = result['choices'][0]['message']['content'].strip()
+
+                # 只返回纯文本描述，由调用者负责格式化
+                return content
+
+            except requests.exceptions.RequestException as e:
+                logging.error(f"LLM API request failed (attempt {attempt + 1}/{self.max_retries}): {e}")
+                if attempt == self.max_retries - 1:
+                    # 重试次数用完，返回失败
+                    logging.error(f"LLM API failed after {self.max_retries} attempts. Endpoint: {self.endpoint}")
+                    return None
+                # 等待一段时间再重试
+                import time
+                wait_time = 2 ** attempt
+                logging.info(f"Waiting {wait_time}s before retry...")
+                time.sleep(wait_time)  # 指数退避
+
+            except (KeyError, IndexError) as e:
+                logging.error(f"LLM API response parsing failed: {e}")
+                logging.error(f"Response content: {response.text[:200]}...")
+                return None
+
+        return None
+
+    def close(self):
+        """关闭 session"""
+        self.session.close()
+
+
 class TenderSlicer:
     """标书切片器 - 将 Word 文档按目录大纲结构切片为多个编号的 Markdown 文件"""
 
@@ -47,6 +189,18 @@ class TenderSlicer:
         self.docx_path = Path(docx_path)
         self.doc = None
         self.sections = []
+
+        # 初始化 LLM 服务
+        if LLM_AVAILABLE:
+            self.llm_service = ImageRecognitionService(
+                endpoint=LLM_API_ENDPOINT,
+                api_key=LLM_API_KEY,
+                model=LLM_MODEL,
+                timeout=LLM_TIMEOUT,
+                max_retries=LLM_MAX_RETRIES
+            )
+        else:
+            self.llm_service = None
 
     def iter_block_items(self, parent):
         """遍历文档中的所有块元素（段落和表格），保持原始顺序"""
@@ -61,22 +215,68 @@ class TenderSlicer:
             elif isinstance(element, CT_Tbl):
                 yield Table(element, parent)
 
+    def get_image_format(self, image_element):
+        """检测图片格式"""
+        # 检查图片的 blip 元素
+        blip = image_element.xpath('.//a:blip')
+        if not blip:
+            return 'png'  # 默认格式
+
+        # 从 r:Embed 或 r:link 关系中获取图像
+        embed = image_element.xpath('.//a:blip/@r:embed')
+        if embed:
+            # 这是嵌入的图像，从文档关系中获取
+            try:
+                image_part = self.doc.part.related_parts[embed[0]]
+                return image_part.content_type.split('/')[-1]
+            except KeyError:
+                return 'png'
+
+        return 'png'
+
+    def get_image_from_relationship(self, image_ref):
+        """从文档关系中提取实际的图像数据"""
+        try:
+            if hasattr(self.doc, 'part') and hasattr(self.doc.part, 'related_parts'):
+                image_part = self.doc.part.related_parts[image_ref]
+                return image_part.blob
+            return None
+        except Exception:
+            return None
+
+    def encode_image_to_base64(self, image_data, image_format):
+        """将图像数据编码为 base64"""
+        import base64
+        return base64.b64encode(image_data).decode('utf-8')
+
     def extract_paragraph_images(self, paragraph):
-        """检测段落中的图片，返回占位符标记"""
+        """检测段落中的图片，返回结构化图像数据"""
         images = []
         for run in paragraph.runs:
             for inline in run._element.xpath('.//w:drawing/wp:inline'):
                 try:
                     blip = inline.xpath('.//a:blip')
                     if blip:
-                        # 检测到图片，记录占位符
-                        images.append("<!-- [图片] -->\n")
-                except Exception:
-                    continue
+                        # 获取图像引用（使用关系 ID 作为唯一标识）
+                        embed = inline.xpath('.//a:blip/@r:embed')
+                        if embed:
+                            # 提取实际图像数据
+                            image_data = self.get_image_from_relationship(embed[0])
+                            if image_data:
+                                image_format = self.get_image_format(inline)
+                                # 使用关系 ID 作为唯一标识
+                                images.append({
+                                    'id': embed[0],
+                                    'data': image_data,
+                                    'format': image_format,
+                                    'placeholder': None  # 占位符由调用者根据行号生成
+                                })
+                except Exception as e:
+                    logging.warning(f"Error extracting paragraph image: {e}")
         return images
 
     def extract_table_images(self, table):
-        """提取表格单元格中的所有图片"""
+        """提取表格单元格中的所有图片，返回结构化图像数据"""
         images = []
         for row in table.rows:
             for cell in row.cells:
@@ -155,6 +355,100 @@ class TenderSlicer:
 
         return '\n'.join(lines) + '\n\n', no
 
+    def table_to_markdown_with_images(self, table, start_no, processed_images):
+        """将表格转换为 Markdown 格式，支持图片合并"""
+        if not table.rows:
+            return None, start_no
+
+        lines = []
+        no = start_no
+
+        # 收集表格中的所有图片
+        table_images = []
+        for row in table.rows:
+            for cell in row.cells:
+                table_images.extend(self.extract_table_images_for_row(cell))
+
+        # 使用 LLM 处理表格图片（如果尚未处理）
+        if table_images:
+            for img in table_images:
+                if img['id'] not in processed_images:
+                    # 单个处理表格图片
+                    if LLM_AVAILABLE and self.llm_service and img['data']:
+                        try:
+                            description = self.llm_service.describe_image(img['data'], img['format'])
+                            if description:
+                                processed_images[img['id']] = description
+                            else:
+                                processed_images[img['id']] = None
+                        except Exception as e:
+                            logging.error(f"Error processing table image {img['id']}: {e}")
+                            processed_images[img['id']] = None
+                    else:
+                        processed_images[img['id']] = None
+
+        # 处理表头
+        header_cells = [cell.text.strip().replace('\n', ' ') for cell in table.rows[0].cells]
+        lines.append(f"<!-- {no} --> | " + " | ".join(header_cells) + " |")
+        lines.append("<!-- " + str(no + 1) + " --> |" + "|".join(["---"] * len(header_cells)) + "|")
+        no += 2
+
+        # 处理数据行
+        for row in table.rows[1:]:
+            # 收集当前行的所有图片
+            row_images = []
+            for cell in row.cells:
+                row_images.extend(self.extract_table_images_for_row(cell))
+
+            # 如果该行有图片，合并输出
+            if row_images:
+                descriptions = []
+                for img in row_images:
+                    desc = processed_images.get(img['id'])
+                    if desc:
+                        descriptions.append(f"[图片: {desc}]")
+                    else:
+                        descriptions.append("[图片: 未识别图片]")
+
+                # 合并图片作为新的一行
+                lines.append(f"<!-- {no} -->{' '.join(descriptions)}")
+                no += 1
+
+            # 添加表格行内容
+            cells = [cell.text.strip().replace('\n', ' ') for cell in row.cells]
+            if not all(cell in ("", " ") for cell in cells):
+                lines.append(f"<!-- {no} --> | " + " | ".join(cells) + " |")
+                no += 1
+
+        return '\n'.join(lines) + '\n\n', no
+
+    def extract_table_images_for_row(self, cell):
+        """从表格单元格中提取图片"""
+        images = []
+        for paragraph in cell.paragraphs:
+            for run in paragraph.runs:
+                for inline in run._element.xpath('.//w:drawing/wp:inline'):
+                    try:
+                        blip = inline.xpath('.//a:blip')
+                        if blip:
+                            # 获取图像引用（使用关系 ID 作为唯一标识）
+                            embed = inline.xpath('.//a:blip/@r:embed')
+                            if embed:
+                                # 提取实际图像数据
+                                image_data = self.get_image_from_relationship(embed[0])
+                                if image_data:
+                                    image_format = self.get_image_format(inline)
+                                    # 使用关系 ID 作为唯一标识
+                                    images.append({
+                                        'id': embed[0],
+                                        'data': image_data,
+                                        'format': image_format,
+                                        'placeholder': None
+                                    })
+                    except Exception as e:
+                        logging.warning(f"Error extracting table image: {e}")
+        return images
+
     def sanitize_filename(self, filename):
         """清理文件名，移除非法字符"""
         import re
@@ -162,6 +456,96 @@ class TenderSlicer:
         if len(filename) > 100:
             filename = filename[:100]
         return filename.strip()
+
+    def process_images_with_llm(self, image_objects):
+        """使用 LLM 处理所有图片，返回识别结果"""
+        if not LLM_AVAILABLE or not self.llm_service:
+            logging.warning("LLM service not available, returning None for all images")
+            return {img['id']: None for img in image_objects}
+
+        logging.info(f"Processing {len(image_objects)} images with LLM")
+
+        results = {}
+        for img in image_objects:
+            try:
+                description = self.llm_service.describe_image(
+                    img['data'],
+                    img['format']
+                )
+                if description:
+                    # 只返回纯文本描述
+                    results[img['id']] = description
+                    logging.info(f"Image {img['id']} processed: {description[:50]}...")
+                else:
+                    # LLM 处理失败，返回 None
+                    results[img['id']] = None
+                    logging.warning(f"Failed to process image {img['id']}, returning None")
+            except Exception as e:
+                logging.error(f"Error processing image {img['id']}: {e}")
+                results[img['id']] = None
+
+        return results
+
+    def process_images_batch(self, image_objects):
+        """批量处理图片，优化性能"""
+        if not LLM_AVAILABLE or not self.llm_service:
+            logging.warning("LLM service not available, returning None for all images")
+            return {img['id']: None for img in image_objects}
+
+        logging.info(f"开始批量处理 {len(image_objects)} 张图片")
+
+        # 过滤需要处理的图片
+        images_to_process = []
+        for img in image_objects:
+            if img['data']:  # 只有有实际数据的图片才处理
+                images_to_process.append(img)
+            else:
+                logging.warning(f"图片 {img['id']} 没有数据，跳过处理")
+
+        if not images_to_process:
+            logging.info("No images to process")
+            return {img['id']: None for img in image_objects}
+
+        # 限制图片大小（例如 10MB）
+        processed_results = {}
+        for i, img in enumerate(images_to_process, 1):
+            try:
+                logging.info(f"正在处理第 {i}/{len(images_to_process)} 张图片: {img['id']}")
+                image_size = len(img['data'])
+                logging.info(f"图片大小: {image_size / 1024:.2f} KB, 格式: {img['format']}")
+
+                if image_size > 10 * 1024 * 1024:  # 10MB
+                    processed_results[img['id']] = None
+                    logging.warning(f"Image {img['id']} too large, skipping")
+                    continue
+
+                logging.info(f"开始调用 LLM API 识别图片 {img['id']}")
+                description = self.llm_service.describe_image(img['data'], img['format'])
+                logging.info(f"LLM API 调用完成，结果长度: {len(description) if description else 0}")
+
+                if description:
+                    # 只返回纯文本描述
+                    processed_results[img['id']] = description
+                    logging.info(f"图片 {img['id']} 处理成功")
+                else:
+                    processed_results[img['id']] = None
+                    logging.warning(f"图片 {img['id']} 识别失败")
+            except Exception as e:
+                logging.error(f"Error processing image {img['id']}: {e}")
+                logging.exception(f"图片 {img['id']} 处理异常详情")
+                processed_results[img['id']] = None
+
+        # 为未处理的图片添加 None
+        for img in image_objects:
+            if img['id'] not in processed_results:
+                processed_results[img['id']] = None
+
+        return processed_results
+
+    def cleanup(self):
+        """清理资源"""
+        if self.llm_service:
+            self.llm_service.close()
 
     def slice_document(self, max_level=None):
         """切片文档，每行添加编号，保留所有表格和图片
@@ -172,6 +556,35 @@ class TenderSlicer:
             None 或 'all' - 按所有标题层级切片
         """
         self.load_document()
+
+        # 收集所有图片
+        all_images = []
+
+        # 遍历文档收集图片
+        logging.info(f"开始提取图片，文档包含 {len(self.doc.paragraphs)} 个段落和 {len(self.doc.tables)} 个表格")
+        for paragraph in self.doc.paragraphs:
+            images = self.extract_paragraph_images(paragraph)
+            all_images.extend(images)
+
+        for table in self.doc.tables:
+            # 为了避免重复，这里不需要再次收集表格图片
+            # 表格图片会在 table_to_markdown_with_images 中处理
+            pass
+
+        logging.info(f"共提取到 {len(all_images)} 张图片")
+
+        # 使用 LLM 处理图片
+        processed_images = {}
+        if LLM_AVAILABLE and self.llm_service and all_images:
+            logging.info(f"开始使用 LLM 处理 {len(all_images)} 张图片")
+            # 使用批处理提高性能
+            processed_images = self.process_images_batch(all_images)
+            logging.info(f"LLM 图片处理完成，成功处理 {len([k for k, v in processed_images.items() if v])} 张图片")
+        else:
+            # LLM 不可用时设置为 None，由调用者生成占位符
+            logging.warning(f"LLM 不可用或没有图片")
+            for img in all_images:
+                processed_images[img['id']] = None
 
         # 零级模式：不按章节切片，整个文档为一个 Markdown 文件
         if max_level == 0:
@@ -206,18 +619,19 @@ class TenderSlicer:
                         line_no += 1
 
                     for img in images:
-                        full_section['content'].append(f"<!-- {line_no} --> {img}")
+                        description = processed_images.get(img['id'])
+                        if description:
+                            # LLM 识别结果，分离行号和图片
+                            full_section['content'].append(f"<!-- {line_no} -->[图片: {description}]\n")
+                        else:
+                            # 使用占位符，分离行号和图片
+                            full_section['content'].append(f"<!-- {line_no} -->[图片: 未识别图片]\n")
                         line_no += 1
 
                 elif isinstance(block, Table):
-                    table_md, line_no = self.table_to_markdown(block, line_no)
+                    table_md, line_no = self.table_to_markdown_with_images(block, line_no, processed_images)
                     if table_md:
                         full_section['content'].append(table_md)
-
-                    table_images = self.extract_table_images(block)
-                    for img in table_images:
-                        full_section['content'].append(f"<!-- {line_no} --> {img}")
-                        line_no += 1
 
             if full_section['content']:
                 sections.append(full_section)
@@ -282,18 +696,19 @@ class TenderSlicer:
                         line_no += 1
 
                 for img in images:
-                    section_stack[-1]['content'].append(f"<!-- {line_no} --> {img}")
+                    description = processed_images.get(img['id'])
+                    if description:
+                        # LLM 识别结果，分离行号和图片
+                        section_stack[-1]['content'].append(f"<!-- {line_no} -->[图片: {description}]\n")
+                    else:
+                        # 使用占位符，分离行号和图片
+                        section_stack[-1]['content'].append(f"<!-- {line_no} -->[图片: 未识别图片]\n")
                     line_no += 1
 
             elif isinstance(block, Table):
-                table_md, line_no = self.table_to_markdown(block, line_no)
+                table_md, line_no = self.table_to_markdown_with_images(block, line_no, processed_images)
                 if table_md:
                     section_stack[-1]['content'].append(table_md)
-
-                table_images = self.extract_table_images(block)
-                for img in table_images:
-                    section_stack[-1]['content'].append(f"<!-- {line_no} --> {img}")
-                    line_no += 1
 
         for section in section_stack:
             if section['content']:
@@ -330,44 +745,64 @@ def index():
 def slice_file():
     """切片文件接口，返回 zip 文件"""
     upload_path = None
+    logging.info("=" * 50)
+    logging.info("收到新的切片请求")
     try:
         if 'file' not in request.files:
+            logging.error("请求中没有文件")
             return jsonify({'error': '未上传文件'}), 400
 
         file = request.files['file']
+        logging.info(f"文件名: {file.filename}, 文件大小: {file.content_length / 1024:.2f} KB")
+
         if file.filename == '':
+            logging.error("文件名为空")
             return jsonify({'error': '文件名为空'}), 400
 
         if not file.filename.endswith('.docx'):
+            logging.error(f"不支持的文件格式: {file.filename}")
             return jsonify({'error': '只支持 .docx 格式'}), 400
 
         max_level = request.form.get('max_level', '0')
+        logging.info(f"切片级别: {max_level}")
+
         try:
             if max_level.lower() == 'all':
                 max_level = None  # 全部层级
             else:
                 max_level = int(max_level)
                 if max_level not in [0, 1, 2, 3]:
+                    logging.error(f"无效的切分层级: {max_level}")
                     return jsonify({'error': '无效的切分层级'}), 400
-        except ValueError:
+        except ValueError as e:
+            logging.error(f"切分层级参数格式错误: {e}")
             return jsonify({'error': '切分层级参数格式错误'}), 400
 
         upload_path = UPLOAD_FOLDER / file.filename
+        logging.info(f"开始保存文件到: {upload_path}")
         file.save(str(upload_path))
+        logging.info(f"文件保存成功")
 
+        logging.info("开始切片文档")
         slicer = TenderSlicer(upload_path)
-        sections = slicer.slice_document(max_level=max_level)
+        try:
+            sections = slicer.slice_document(max_level=max_level)
+            logging.info(f"切片完成，共生成 {len(sections)} 个切片")
+        finally:
+            slicer.cleanup()
 
         zip_buffer = io.BytesIO()
 
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for section in sections:
+            logging.info(f"开始生成 ZIP 文件，包含 {len(sections)} 个章节")
+            for i, section in enumerate(sections, 1):
                 index = section['index'] + 1
                 index_str = str(index).zfill(3)
                 safe_title = slicer.sanitize_filename(section['title'])
                 filename = f"{index_str}_{safe_title}.md"
                 content = ''.join(section['content'])
                 zipf.writestr(filename, content.encode('utf-8'))
+                logging.debug(f"已添加第 {i}/{len(sections)} 个文件: {filename}")
 
             index_content = "# 标书切片索引\n\n"
             index_content += f"原文件: {file.filename}\n"
@@ -383,6 +818,7 @@ def slice_file():
             zipf.writestr("00_index.md", index_content.encode('utf-8'))
 
         zip_buffer.seek(0)
+        logging.info(f"ZIP 文件生成完成，大小: {zip_buffer.getbuffer().nbytes / 1024:.2f} KB")
 
         try:
             upload_path.unlink()
@@ -390,6 +826,9 @@ def slice_file():
             pass
 
         safe_filename = quote(f"sliced_{file.filename}.zip", safe='')
+        logging.info(f"准备发送响应，文件名: {safe_filename}")
+        logging.info("切片请求处理成功完成")
+        logging.info("=" * 50)
         return app.response_class(
             zip_buffer.getvalue(),
             mimetype='application/zip',
@@ -401,7 +840,10 @@ def slice_file():
 
     except Exception as e:
         import traceback
-        traceback.print_exc()
+        logging.error("切片请求处理失败")
+        logging.error(f"错误类型: {type(e).__name__}")
+        logging.error(f"错误信息: {str(e)}")
+        logging.error(f"堆栈跟踪:\n{traceback.format_exc()}")
 
         if upload_path and upload_path.exists():
             try:
@@ -412,6 +854,8 @@ def slice_file():
         error_msg = str(e)
         if len(error_msg) > 500:
             error_msg = error_msg[:500] + '...'
+        logging.error(f"返回错误响应: {error_msg}")
+        logging.info("=" * 50)
         return jsonify({'error': error_msg}), 500
 
 
@@ -702,7 +1146,8 @@ _INDEX_HTML = '''<!DOCTYPE html>
             updateProgress(10, '正在上传...');
 
             const controller = new AbortController();
-            const timeoutMs = Math.max(300000, selectedFile.size * 0.001);
+            // 增加超时时间：最少 1 小时，或根据文件大小计算
+            const timeoutMs = Math.max(3600000, selectedFile.size * 0.005);
             const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
             try {
