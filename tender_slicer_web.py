@@ -783,11 +783,49 @@ def slice_file():
         file.save(str(upload_path))
         logging.info(f"文件保存成功")
 
+        # 验证文件
+        if upload_path.stat().st_size == 0:
+            logging.error(f"文件大小为 0，可能是上传失败")
+            upload_path.unlink()
+            return jsonify({'error': '上传的文件为空，请重新上传'}), 400
+
+        # 检查是否为有效的 ZIP 文件（docx 本质是 ZIP）
+        try:
+            import zipfile
+            with zipfile.ZipFile(upload_path, 'r') as zf:
+                # 检查必要的文件是否存在
+                required_files = ['[Content_Types].xml', '_rels/.rels', 'word/document.xml']
+                for req_file in required_files:
+                    try:
+                        zf.getinfo(req_file)
+                    except KeyError:
+                        logging.error(f"docx 文件缺少必要文件: {req_file}")
+                        upload_path.unlink()
+                        return jsonify({'error': f'docx 文件格式不正确，缺少 {req_file}'}), 400
+        except zipfile.BadZipFile:
+            logging.error("文件不是有效的 ZIP 文件")
+            upload_path.unlink()
+            return jsonify({'error': '文件不是有效的 docx 格式'}), 400
+        except Exception as e:
+            logging.error(f"验证文件时出错: {e}")
+            upload_path.unlink()
+            return jsonify({'error': f'文件验证失败: {str(e)}'}), 400
+
         logging.info("开始切片文档")
         slicer = TenderSlicer(upload_path)
         try:
             sections = slicer.slice_document(max_level=max_level)
             logging.info(f"切片完成，共生成 {len(sections)} 个切片")
+        except KeyError as e:
+            error_msg = str(e)
+            if "NULL" in error_msg or "archive" in error_msg:
+                # 特殊处理 docx 文件损坏的情况
+                logging.error("docx 文件内部结构损坏或格式异常")
+                slicer.cleanup()
+                if upload_path.exists():
+                    upload_path.unlink()
+                return jsonify({'error': 'docx 文件内部结构损坏或格式异常。请尝试用 Microsoft Word 打开文件并另存为新的 docx 文件后再上传。'}), 400
+            raise
         finally:
             slicer.cleanup()
 
