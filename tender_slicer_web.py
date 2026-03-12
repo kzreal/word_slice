@@ -1268,5 +1268,6 @@ _INDEX_HTML = '''<!DOCTYPE html>
 if __name__ == '__main__':
     print("标书切片工具 - Web 版本")
     print("请在浏览器中访问: http://localhost:8000")
+    print("局域网访问: http://[您的IP地址]:8000")
     print("按 Ctrl+C 停止服务器")
     app.run(host='0.0.0.0', port=8000, debug=True, threaded=True)
